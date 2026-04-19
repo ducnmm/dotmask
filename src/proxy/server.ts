@@ -347,6 +347,8 @@ async function forwardRequest(
   const outHeaders: Record<string, string> = { ...reqHeaders };
   outHeaders["content-length"] = String(finalBody.length);
   delete outHeaders["transfer-encoding"]; // we've buffered, no chunked
+  // Force plain-text response — compressed bodies can't be scanned for secrets.
+  outHeaders["accept-encoding"] = "identity";
 
   const outSocket = tls.connect({ host: hostname, port, servername: hostname });
 
@@ -386,39 +388,51 @@ async function forwardRequest(
   // We collect all raw SSE bytes and unmask the fully-assembled stream at once.
   let sseRawBuf: Buffer = Buffer.alloc(0);
 
-  // Fragment-aware unmask for SSE partial_json deltas.
+  // Fragment-aware unmask for SSE partial_json deltas and text_delta events.
   function unmaskSseFragments(text: string): string {
-    // Simple pass: replace contiguous fake keys (handles text_delta echoes).
+    // Simple pass: replace contiguous fake keys (handles cases where full fake
+    // key appears in a single event or non-streaming JSON response).
     let result = text;
     const { unmasked: simple, count: simpleCount } = unmaskText(text, fakeToReal);
     if (simpleCount > 0) { result = simple; dbg(`[SSE] simple unmask: ${simpleCount}`); }
 
-    // Fragment pass: partial_json values are tiny fragments; concat+unmask+redistribute.
-    const frags: { start: number; end: number; decoded: string }[] = [];
-    const re = /"partial_json":"((?:[^"\\]|\\.)*)"/g;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(result)) !== null) {
-      const valueStart = m.index + '"partial_json":"'.length;
-      let decoded: string;
-      try { decoded = JSON.parse('"' + m[1] + '"'); } catch { continue; }
-      frags.push({ start: valueStart, end: valueStart + m[1].length, decoded });
-    }
-    if (frags.length > 0) {
+    // Helper: collect all JSON string values for a field, concat, unmask, redistribute.
+    function reassembleField(src: string, fieldName: string): string {
+      const frags: { start: number; end: number; decoded: string }[] = [];
+      const prefix = `"${fieldName}":"`;
+      const re = new RegExp(`"${fieldName}":"((?:[^"\\\\]|\\\\.)*)"`, "g");
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(src)) !== null) {
+        const valueStart = m.index + prefix.length;
+        let decoded: string;
+        try { decoded = JSON.parse('"' + m[1] + '"'); } catch { continue; }
+        frags.push({ start: valueStart, end: valueStart + m[1].length, decoded });
+      }
+      if (frags.length === 0) return src;
       const logical = frags.map(f => f.decoded).join("");
       const { unmasked: lu, count } = unmaskText(logical, fakeToReal);
-      if (count > 0) {
-        dbg(`[SSE] fragment unmask: ${count} partial_json secret(s)`);
-        let logPos = 0;
-        const newVals: string[] = [];
-        for (const frag of frags) {
-          newVals.push(JSON.stringify(lu.slice(logPos, logPos + frag.decoded.length)).slice(1, -1));
-          logPos += frag.decoded.length;
-        }
-        for (let i = frags.length - 1; i >= 0; i--) {
-          result = result.slice(0, frags[i].start) + newVals[i] + result.slice(frags[i].end);
-        }
+      if (count === 0) return src;
+      dbg(`[SSE] fragment unmask (${fieldName}): ${count} secret(s)`);
+      let logPos = 0;
+      const newVals: string[] = [];
+      for (const frag of frags) {
+        newVals.push(JSON.stringify(lu.slice(logPos, logPos + frag.decoded.length)).slice(1, -1));
+        logPos += frag.decoded.length;
       }
+      let out = src;
+      for (let i = frags.length - 1; i >= 0; i--) {
+        out = out.slice(0, frags[i].start) + newVals[i] + out.slice(frags[i].end);
+      }
+      return out;
     }
+
+    // partial_json: tool-call argument fragments (Anthropic streaming)
+    result = reassembleField(result, "partial_json");
+    // text: text_delta content fragments (Anthropic streaming)
+    result = reassembleField(result, "text");
+    // content: OpenAI-compatible streaming format
+    result = reassembleField(result, "content");
+
     return result;
   }
 
