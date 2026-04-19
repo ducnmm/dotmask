@@ -217,18 +217,6 @@ function handleConnect(
   const [hostname, portStr] = (req.url ?? "").split(":");
   const targetPort = parseInt(portStr ?? "443");
 
-  if (!isAiDomain(hostname)) {
-    // Not an AI domain — tunnel transparently (no MITM)
-    const remote = net.connect(targetPort, hostname, () => {
-      clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-      remote.pipe(clientSocket);
-      clientSocket.pipe(remote);
-    });
-    remote.on("error", () => clientSocket.destroy());
-    clientSocket.on("error", () => remote.destroy());
-    return;
-  }
-
   dbg(`CONNECT intercept: ${hostname}:${targetPort}`);
 
   // MITM: respond with 200, then wrap in TLS using our generated cert
