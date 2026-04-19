@@ -1,0 +1,22 @@
+node_modules/
+dist/
+*.backup
+
+# Logs
+*.log
+*.err.log
+
+# Local env overrides (keep .env.example, not real secrets)
+.env
+.env.local
+.env.*.local
+
+# npm pack output
+*.tgz
+
+# IDE/Editors
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
