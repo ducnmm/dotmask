@@ -9,15 +9,29 @@ export const CA_CERT_PATH = path.join(CA_DIR, "ca.pem");
 export const CA_KEY_PATH = path.join(CA_DIR, "ca.key.pem");
 
 const KEYCHAIN_CERT_LABEL = "dotmask-proxy-ca";
+const LOGIN_KEYCHAIN_PATH = path.join(os.homedir(), "Library", "Keychains", "login.keychain-db");
+
+function normalizePem(pem: string): string {
+  return pem.replace(/\r\n/g, "\n").trim();
+}
+
+function extractPemBlocks(text: string): string[] {
+  return text.match(/-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/g) ?? [];
+}
 
 /** Check whether the CA cert is already trusted in macOS Keychain. */
 export function isCertTrusted(): boolean {
+  if (!certExists()) return false;
+
   try {
     const result = spawnSync("security", [
-      "find-certificate", "-c", KEYCHAIN_CERT_LABEL, "-a",
-      path.join(os.homedir(), "Library", "Keychains", "login.keychain-db"),
+      "find-certificate", "-c", KEYCHAIN_CERT_LABEL, "-a", "-p",
+      LOGIN_KEYCHAIN_PATH,
     ], { encoding: "utf8" });
-    return result.status === 0 && result.stdout.includes(KEYCHAIN_CERT_LABEL);
+    if (result.status !== 0) return false;
+
+    const currentCert = normalizePem(fs.readFileSync(CA_CERT_PATH, "utf8"));
+    return extractPemBlocks(result.stdout).some((pem) => normalizePem(pem) === currentCert);
   } catch {
     return false;
   }
@@ -39,7 +53,7 @@ export function installCert(): boolean {
       "add-trusted-cert",
       "-d",
       "-r", "trustRoot",
-      "-k", path.join(os.homedir(), "Library", "Keychains", "login.keychain-db"),
+      "-k", LOGIN_KEYCHAIN_PATH,
       CA_CERT_PATH,
     ], { stdio: "inherit" });
     return true;
@@ -54,7 +68,7 @@ export function uninstallCert(): void {
     execFileSync("security", [
       "delete-certificate",
       "-c", KEYCHAIN_CERT_LABEL,
-      path.join(os.homedir(), "Library", "Keychains", "login.keychain-db"),
+      LOGIN_KEYCHAIN_PATH,
     ], { stdio: "pipe" });
   } catch { /* already removed */ }
 }

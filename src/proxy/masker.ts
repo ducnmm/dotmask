@@ -34,7 +34,7 @@ const KNOWN_TOKEN_PARTS = [
   String.raw`sk-[A-Za-z0-9\-_+/]{20,}`,                                           // generic sk-
   String.raw`AIza[A-Za-z0-9\-_]{35,}`,                                             // Google AI
   String.raw`suiprivkey[a-z0-9]{40,}`,                                             // Sui (bech32)
-  String.raw`0x[0-9a-fA-F]{40,}`,                                                  // Ethereum/EVM
+  String.raw`0x[0-9a-fA-F]{64}`,                                                   // EVM private key
   String.raw`ghp_[A-Za-z0-9+/]{30,}`,                                             // GitHub PAT
   String.raw`gho_[A-Za-z0-9+/]{30,}`,                                             // GitHub OAuth
   String.raw`github_pat_[A-Za-z0-9_]{25,}`,                                        // GitHub fine-grained
@@ -76,10 +76,24 @@ const KNOWN_PREFIXES = [
   /^(mongodb:\/\/[^:]+:)/,
 ];
 
-function detectCharset(payload: string): string {
+function detectCharset(value: string, payload: string): string {
+  if (value.startsWith("AKIA")) return "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  if (value.startsWith("sk_live_") || value.startsWith("sk_test_")) {
+    return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  }
+  if (value.startsWith("ghp_") || value.startsWith("gho_")) {
+    return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  }
+  if (value.startsWith("github_pat_")) return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_";
+  if (value.startsWith("suiprivkey")) return "1qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+
+  if (/^[0-9]+$/.test(payload)) return "0123456789";
   if (/^[0-9a-f]+$/.test(payload)) return "0123456789abcdef";
   if (/^[0-9A-F]+$/.test(payload)) return "0123456789ABCDEF";
   if (/^[0-9a-fA-F]+$/.test(payload)) return "0123456789abcdefABCDEF";
+  if (/^[A-Z0-9]+$/.test(payload)) return "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  if (/^[a-z0-9]+$/.test(payload)) return "abcdefghijklmnopqrstuvwxyz0123456789";
+  if (/^[A-Za-z0-9]+$/.test(payload)) return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
   // Check URL-safe charset BEFORE standard Base64 — prevents fake keys from
   // containing '+' and '/' which break the KNOWN_TOKEN_RE and unmask step.
   if (/^[A-Za-z0-9_-]+$/.test(payload)) return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
@@ -122,7 +136,7 @@ export function makeFake(value: string): string {
   const payload = value.slice(prefix.length);
   if (!payload) return value;
 
-  const charset = detectCharset(payload);
+  const charset = detectCharset(value, payload);
   const hash = crypto.createHash("sha256").update(value).digest("hex");
   const seed = parseInt(hash.slice(0, 8), 16);
 
@@ -197,7 +211,11 @@ function keychainStore(fakeKey: string, realValue: string): void {
     execFileSync("security", [
       "add-generic-password", "-s", KEYCHAIN_SERVICE, "-a", fakeKey, "-w", realValue,
     ], { stdio: "pipe" });
-  } catch { /* ignore */ }
+  } catch (err) {
+    throw new Error(
+      `failed to store secret mapping in Keychain for ${fakeKey}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
 }
 
 function registerMapping(real: string, fake: string): void {
@@ -221,7 +239,9 @@ function registerMapping(real: string, fake: string): void {
     fs.writeFileSync(PROMPT_MAP_FILE, JSON.stringify(existing, null, 2) + "\n", "utf8");
     fs.chmodSync(PROMPT_MAP_FILE, 0o600);
   }
-  invalidateCache(); // force reload on next request
+  if (realToFakeCache) realToFakeCache.set(real, fake);
+  if (fakeToRealCache) fakeToRealCache.set(fake, real);
+  if (realToFakeCache || fakeToRealCache) cacheTime = Date.now();
 }
 
 // ── Keychain map cache (avoid repeated CLI calls per request) ─────────────────
@@ -231,13 +251,7 @@ let fakeToRealCache: Map<string, string> | null = null;
 let cacheTime = 0;
 
 function isCacheValid(): boolean {
-  return Date.now() - cacheTime < CACHE_TTL_MS && realToFakeCache !== null;
-}
-
-function invalidateCache(): void {
-  realToFakeCache = null;
-  fakeToRealCache = null;
-  cacheTime = 0;
+  return Date.now() - cacheTime < CACHE_TTL_MS && realToFakeCache !== null && fakeToRealCache !== null;
 }
 
 /** Load real→fake + fake→real maps from Keychain in parallel. */
@@ -290,6 +304,10 @@ async function ensureCache(): Promise<void> {
   await cacheBuilding;
 }
 
+export async function warmMaskCacheAsync(): Promise<void> {
+  await ensureCache();
+}
+
 /** Load real→fake map (async, parallel Keychain lookups). */
 export async function loadRealToFakeMapAsync(): Promise<Map<string, string>> {
   await ensureCache();
@@ -307,7 +325,13 @@ export function loadRealToFakeMap(): Map<string, string> {
   if (isCacheValid()) return realToFakeCache!;
 
   const map = new Map<string, string>();
-  if (!fs.existsSync(MAPS_DIR)) return map;
+  const f2r = new Map<string, string>();
+  if (!fs.existsSync(MAPS_DIR)) {
+    realToFakeCache = map;
+    fakeToRealCache = f2r;
+    cacheTime = Date.now();
+    return map;
+  }
 
   const jsonFiles = fs.readdirSync(MAPS_DIR).filter(f => f.endsWith(".json"));
   for (const file of jsonFiles) {
@@ -316,12 +340,16 @@ export function loadRealToFakeMap(): Map<string, string> {
       if (!Array.isArray(fakeKeys)) continue;
       for (const fake of fakeKeys as string[]) {
         const real = keychainLookup(fake);
-        if (real && !map.has(real)) map.set(real, fake);
+        if (real) {
+          if (!map.has(real)) map.set(real, fake);
+          f2r.set(fake, real);
+        }
       }
     } catch { /* skip corrupt files */ }
   }
 
   realToFakeCache = map;
+  fakeToRealCache = f2r;
   cacheTime = Date.now();
   return map;
 }
@@ -419,8 +447,8 @@ export function unmaskText(text: string, fakeToReal: Map<string, string>): { unm
 /**
  * Mask secrets in a parsed Anthropic/OpenAI messages array (request).
  */
-export function maskMessages(messages: unknown[]): number {
-  const realToFake = loadRealToFakeMap();
+export function maskMessages(messages: unknown[], realToFake?: Map<string, string>): number {
+  const map = realToFake ?? loadRealToFakeMap();
   let total = 0;
 
   for (const msg of messages) {
@@ -428,7 +456,7 @@ export function maskMessages(messages: unknown[]): number {
     const m = msg as Record<string, unknown>;
 
     if (typeof m.content === "string") {
-      const { masked, count } = maskText(m.content, realToFake);
+      const { masked, count } = maskText(m.content, map);
       m.content = masked;
       total += count;
     } else if (Array.isArray(m.content)) {
@@ -436,14 +464,88 @@ export function maskMessages(messages: unknown[]): number {
         if (typeof part === "object" && part !== null) {
           const p = part as Record<string, unknown>;
           if (typeof p.text === "string") {
-            const { masked, count } = maskText(p.text, realToFake);
+            const { masked, count } = maskText(p.text, map);
             p.text = masked;
             total += count;
+          }
+          if (typeof p.content === "string") {
+            const { masked, count } = maskText(p.content, map);
+            p.content = masked;
+            total += count;
+          } else if (Array.isArray(p.content)) {
+            for (const sub of p.content) {
+              if (typeof sub !== "object" || sub === null) continue;
+              const s = sub as Record<string, unknown>;
+              if (typeof s.text === "string") {
+                const { masked, count } = maskText(s.text, map);
+                s.text = masked;
+                total += count;
+              }
+            }
           }
         }
       }
     }
   }
+  return total;
+}
+
+/**
+ * Mask user-provided text fields in known AI request payload shapes.
+ */
+export function maskJsonPayload(body: unknown, realToFake?: Map<string, string>): number {
+  const map = realToFake ?? loadRealToFakeMap();
+  let total = 0;
+
+  function maskStringField(record: Record<string, unknown>, key: string): void {
+    if (typeof record[key] !== "string") return;
+    const { masked, count } = maskText(record[key] as string, map);
+    record[key] = masked;
+    total += count;
+  }
+
+  function walk(node: unknown): void {
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item);
+      return;
+    }
+    if (typeof node !== "object" || node === null) return;
+
+    const record = node as Record<string, unknown>;
+    maskStringField(record, "text");
+    maskStringField(record, "input_text");
+    maskStringField(record, "instructions");
+
+    if (typeof record.content === "string") {
+      maskStringField(record, "content");
+    } else if (Array.isArray(record.content)) {
+      walk(record.content);
+    }
+
+    if (typeof record.input === "string") {
+      maskStringField(record, "input");
+    } else if (Array.isArray(record.input)) {
+      walk(record.input);
+    }
+
+    if (typeof record.system === "string") {
+      maskStringField(record, "system");
+    } else if (Array.isArray(record.system) || (typeof record.system === "object" && record.system !== null)) {
+      walk(record.system);
+    }
+
+    for (const key of ["messages", "contents", "parts"]) {
+      if (Array.isArray(record[key])) {
+        walk(record[key]);
+      }
+    }
+
+    if (typeof record.system_instruction === "object" && record.system_instruction !== null) {
+      walk(record.system_instruction);
+    }
+  }
+
+  walk(body);
   return total;
 }
 

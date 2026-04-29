@@ -106,3 +106,18 @@ export function isDaemonRunning(): boolean {
     return false;
   }
 }
+
+export function getDaemonPort(): number | null {
+  if (!fs.existsSync(PLIST_PATH)) return null;
+
+  try {
+    const plist = fs.readFileSync(PLIST_PATH, "utf8");
+    const match = /<string>--port<\/string>\s*<string>(\d+)<\/string>/.exec(plist);
+    if (!match) return null;
+
+    const port = Number.parseInt(match[1], 10);
+    return Number.isInteger(port) && port >= 1 && port <= 65535 ? port : null;
+  } catch {
+    return null;
+  }
+}

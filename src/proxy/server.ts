@@ -16,35 +16,28 @@ import { StringDecoder } from "node:string_decoder";
 import path from "node:path";
 import os from "node:os";
 import { spawnSync } from "node:child_process";
-import { isAiDomain, maskText, unmaskText, loadFakeToRealMapAsync, loadRealToFakeMapAsync, findSafeFlushLength } from "./masker.js";
-import { CA_DIR, CA_CERT_PATH, CA_KEY_PATH } from "./cert.js";
-
-function decodeChunked(buffer: Buffer): Buffer {
-  const chunks: Buffer[] = [];
-  let offset = 0;
-  while (offset < buffer.length) {
-    const nextCrLf = buffer.indexOf("\r\n", offset);
-    if (nextCrLf === -1) break;
-    const hex = buffer.toString("utf8", offset, nextCrLf).trim();
-    const len = parseInt(hex, 16);
-    if (isNaN(len)) break;
-    if (len === 0) break;
-    chunks.push(buffer.subarray(nextCrLf + 2, nextCrLf + 2 + len));
-    offset = nextCrLf + 2 + len + 2;
-  }
-  return Buffer.concat(chunks);
-}
+import { unmaskText, loadFakeToRealMapAsync, loadRealToFakeMapAsync, findSafeFlushLength, warmMaskCacheAsync, maskJsonPayload } from "./masker.js";
+import { CA_DIR, CA_CERT_PATH, CA_KEY_PATH, DOTMASK_DIR } from "./cert.js";
+import { loadAllowedHosts, normalizeHost } from "./config.js";
+import { IncrementalChunkedBodyParser, SseEventBuffer, encodeChunkedPayload, TERMINAL_CHUNK } from "./sse.js";
+import { parseCompleteHttpRequest } from "./http.js";
+import { parsePortFlag } from "../utils.js";
 
 // ── Config ───────────────────────────────────────────────────────────────
 
 
 const args = process.argv.slice(2);
-const portIdx = args.indexOf("--port");
-const PORT = portIdx >= 0 ? parseInt(args[portIdx + 1]) : 18787;
+const PORT = parsePortFlag(args, 18787);
 
 const DEBUG = process.env.DOTMASK_DEBUG === "1";
 function dbg(...msg: unknown[]): void {
   if (DEBUG) console.error("[dotmask][proxy]", ...msg);
+}
+
+const ALLOWED_HOSTS = loadAllowedHosts();
+
+function shouldMitmHost(hostname: string): boolean {
+  return ALLOWED_HOSTS.has(normalizeHost(hostname));
 }
 
 // ── TLS: per-hostname certificate generation ──────────────────────────────────
@@ -122,15 +115,15 @@ function ensureCA(): void {
   fs.chmodSync(CA_DIR, 0o700);
 
   // Generate CA key
-  spawnSync("openssl", ["genrsa", "-out", CA_KEY_PATH, "4096"], { stdio: "pipe" });
+  execOpenssl(["genrsa", "-out", CA_KEY_PATH, "4096"]);
   // Generate CA cert
-  spawnSync("openssl", [
+  execOpenssl([
     "req", "-new", "-x509", "-days", "3650", "-key", CA_KEY_PATH,
     "-out", CA_CERT_PATH,
     "-subj", "/CN=dotmask-proxy-ca/O=dotmask/OU=dotmask-proxy-ca",
     "-addext", "basicConstraints=critical,CA:TRUE",
     "-addext", "keyUsage=critical,keyCertSign,cRLSign",
-  ], { stdio: "pipe" });
+  ]);
 
   fs.chmodSync(CA_KEY_PATH, 0o600);
   fs.chmodSync(CA_CERT_PATH, 0o644);
@@ -140,71 +133,33 @@ function ensureCA(): void {
 // ── Request body masking ──────────────────────────────────────────────────────
 
 async function maskRequestBody(rawBody: Buffer, host: string): Promise<Buffer> {
+  let body: unknown;
   try {
-    const body = JSON.parse(rawBody.toString("utf8"));
-    // Load real→fake map once for all sections
-    const realToFake = await loadRealToFakeMapAsync();
-    let totalCount = 0;
+    body = JSON.parse(rawBody.toString("utf8"));
+  } catch {
+    return rawBody; // non-JSON body — pass through
+  }
 
-    // Mask messages array
-    if (Array.isArray(body.messages)) {
-      for (const msg of body.messages as unknown[]) {
-        if (typeof msg !== "object" || msg === null) continue;
-        const m = msg as Record<string, unknown>;
-        if (typeof m.content === "string") {
-          const { masked, count: c } = maskText(m.content, realToFake);
-          m.content = masked; totalCount += c;
-        } else if (Array.isArray(m.content)) {
-          for (const part of m.content) {
-            if (typeof part === "object" && part !== null) {
-              const p = part as Record<string, unknown>;
-              if (typeof p.text === "string") {
-                const { masked, count: c } = maskText(p.text, realToFake);
-                p.text = masked; totalCount += c;
-              }
-              // tool_result content
-              if (typeof p.content === "string") {
-                const { masked, count: c } = maskText(p.content, realToFake);
-                p.content = masked; totalCount += c;
-              } else if (Array.isArray(p.content)) {
-                for (const sub of p.content as unknown[]) {
-                  if (typeof sub === "object" && sub !== null) {
-                    const s = sub as Record<string, unknown>;
-                    if (typeof s.text === "string") {
-                      const { masked, count: c } = maskText(s.text, realToFake);
-                      s.text = masked; totalCount += c;
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-
-    // System prompt: string OR array of content blocks (Claude Code uses array for caching)
-    if (typeof body.system === "string") {
-      const { masked, count } = maskText(body.system, realToFake);
-      body.system = masked; totalCount += count;
-    } else if (Array.isArray(body.system)) {
-      for (const block of body.system as unknown[]) {
-        if (typeof block === "object" && block !== null) {
-          const b = block as Record<string, unknown>;
-          if (typeof b.text === "string") {
-            const { masked, count } = maskText(b.text, realToFake);
-            b.text = masked; totalCount += count;
-          }
-        }
-      }
-    }
-
-    if (totalCount > 0) {
-      dbg(`masked ${totalCount} secret(s) in request to ${host}`);
-      return Buffer.from(JSON.stringify(body), "utf8");
-    }
-  } catch { /* non-JSON body — pass through */ }
+  const realToFake = await loadRealToFakeMapAsync();
+  const totalCount = maskJsonPayload(body, realToFake);
+  if (totalCount > 0) {
+    dbg(`masked ${totalCount} secret(s) in request to ${host}`);
+    return Buffer.from(JSON.stringify(body), "utf8");
+  }
   return rawBody;
+}
+
+function writeProxyErrorResponse(clientTls: tls.TLSSocket, message: string): void {
+  if (clientTls.destroyed) return;
+  const body = JSON.stringify({ error: message });
+  clientTls.end(
+    `HTTP/1.1 502 Bad Gateway\r\n` +
+    `Content-Type: application/json\r\n` +
+    `Content-Length: ${Buffer.byteLength(body, "utf8")}\r\n` +
+    `Connection: close\r\n\r\n` +
+    body,
+    "utf8",
+  );
 }
 
 // ── HTTPS CONNECT tunnel handler ──────────────────────────────────────────────
@@ -212,12 +167,45 @@ async function maskRequestBody(rawBody: Buffer, host: string): Promise<Buffer> {
 function handleConnect(
   req: http.IncomingMessage,
   clientSocket: net.Socket,
-  _head: Buffer,
+  head: Buffer,
 ): void {
   const [hostname, portStr] = (req.url ?? "").split(":");
-  const targetPort = parseInt(portStr ?? "443");
+  const targetPort = Number.parseInt(portStr ?? "443", 10) || 443;
 
-  dbg(`CONNECT intercept: ${hostname}:${targetPort}`);
+  if (!hostname) {
+    clientSocket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+    return;
+  }
+
+  if (!shouldMitmHost(hostname)) {
+    dbg(`CONNECT passthrough: ${hostname}:${targetPort}`);
+    const upstreamSocket = net.connect({ host: hostname, port: targetPort });
+    let connected = false;
+
+    upstreamSocket.on("connect", () => {
+      connected = true;
+      clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      if (head.length > 0) upstreamSocket.write(head);
+      upstreamSocket.pipe(clientSocket);
+      clientSocket.pipe(upstreamSocket);
+    });
+
+    upstreamSocket.on("error", (e) => {
+      dbg("passthrough upstream error:", e.message);
+      if (!connected && !clientSocket.destroyed) {
+        clientSocket.end("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
+      }
+      upstreamSocket.destroy();
+      clientSocket.destroy();
+    });
+
+    clientSocket.on("error", () => upstreamSocket.destroy());
+    clientSocket.on("close", () => upstreamSocket.destroy());
+    upstreamSocket.on("close", () => clientSocket.destroy());
+    return;
+  }
+
+  dbg(`CONNECT MITM: ${hostname}:${targetPort}`);
 
   // MITM: respond with 200, then wrap in TLS using our generated cert
   clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
@@ -237,81 +225,41 @@ function handleConnect(
     key: hostCert.key,
   });
 
+  if (head.length > 0) {
+    clientSocket.unshift(head);
+  }
+
   tlsServer.on("error", (e) => dbg("tls error:", e.message));
 
   // Parse the decrypted HTTP request
-  const chunks: Buffer[] = [];
-  let headersDone = false;
-  let headers = "";
-  let bodyExpected = 0;
-  let bodyReceived = 0;
-  let requestLine = "";
-  let reqHeaders: Record<string, string> = {};
-  let headerLength = 0;
+  let pending = Buffer.alloc(0);
+  let requestChain = Promise.resolve();
+  let connectionFailed = false;
+
+  function startForward(requestLine: string, reqHeaders: Record<string, string>, bodyBuf: Buffer): void {
+    requestChain = requestChain.then(async () => {
+      if (connectionFailed || tlsServer.destroyed) return;
+      await forwardRequest(hostname, targetPort, requestLine, reqHeaders, bodyBuf, tlsServer);
+    }).catch((e) => {
+      connectionFailed = true;
+      dbg("forward request failed:", e);
+      writeProxyErrorResponse(
+        tlsServer,
+        e instanceof Error ? `dotmask blocked request before it left your machine: ${e.message}` : "dotmask blocked request before it left your machine",
+      );
+      throw e;
+    });
+  }
 
   tlsServer.on("data", (chunk: Buffer) => {
-    chunks.push(chunk);
-    const raw = Buffer.concat(chunks).toString("binary");
+    pending = Buffer.concat([pending, chunk]);
 
-    if (!headersDone) {
-      const split = raw.indexOf("\r\n\r\n");
-      if (split === -1) return; // wait for more data
+    while (true) {
+      const parsed = parseCompleteHttpRequest(pending);
+      if (!parsed) return;
 
-      headersDone = true;
-      headers = raw.slice(0, split);
-      const body = raw.slice(split + 4);
-
-      const lines = headers.split("\r\n");
-      requestLine = lines[0];
-      reqHeaders = {};
-      for (const line of lines.slice(1)) {
-        const idx = line.indexOf(": ");
-        if (idx >= 0) reqHeaders[line.slice(0, idx).toLowerCase()] = line.slice(idx + 2);
-      }
-      const isChunked = reqHeaders["transfer-encoding"]?.includes("chunked");
-      bodyExpected = parseInt(reqHeaders["content-length"] ?? "0");
-      bodyReceived = Buffer.byteLength(body, "binary");
-      headerLength = split + 4;
-
-      let isComplete = false;
-      if (isChunked) {
-        isComplete = raw.endsWith("0\r\n\r\n");
-      } else {
-        isComplete = bodyReceived >= bodyExpected;
-      }
-
-      if (isComplete) {
-        let finalBodyBuf = Buffer.from(body, "binary");
-        if (isChunked) {
-          // @ts-ignore: Buffer type mismatch workaround
-          finalBodyBuf = decodeChunked(finalBodyBuf);
-        }
-        void forwardRequest(hostname, targetPort, requestLine, reqHeaders, finalBodyBuf, tlsServer);
-        chunks.length = 0;
-        headersDone = false;
-      }
-    } else {
-      const allBodyBuf = Buffer.concat(chunks).subarray(headerLength);
-      bodyReceived = allBodyBuf.length;
-      
-      const isChunked = reqHeaders["transfer-encoding"]?.includes("chunked");
-      let isComplete = false;
-      if (isChunked) {
-         isComplete = allBodyBuf.length >= 5 && allBodyBuf.subarray(allBodyBuf.length - 5).toString() === "0\r\n\r\n";
-      } else {
-         isComplete = bodyReceived >= bodyExpected;
-      }
-
-      if (isComplete) {
-        let bodyBuf = allBodyBuf;
-        if (isChunked) {
-          // @ts-ignore: Buffer type mismatch workaround
-          bodyBuf = decodeChunked(bodyBuf);
-        }
-        forwardRequest(hostname, targetPort, requestLine, reqHeaders, bodyBuf, tlsServer);
-        chunks.length = 0;
-        headersDone = false;
-      }
+      pending = pending.subarray(parsed.bytesConsumed);
+      startForward(parsed.requestLine, parsed.headers, parsed.body);
     }
   });
 }
@@ -327,37 +275,167 @@ async function forwardRequest(
   const method = requestLine.split(" ")[0];
   const urlPath = requestLine.split(" ")[1] ?? "/";
 
-  // Mask body if JSON (async — parallel Keychain lookups).
-  // IMPORTANT: must happen BEFORE loadFakeToRealMapAsync so that any new
-  // mappings registered here (via registerMapping → invalidateCache) are
-  // included in the fakeToReal map used for response unmasking.
   const contentType = reqHeaders["content-type"] ?? "";
   let finalBody = bodyBuf;
   if (contentType.includes("application/json") && method !== "GET") {
     finalBody = await maskRequestBody(bodyBuf, hostname);
   }
 
-  // Load fake→real map AFTER masking (fresh — includes any newly registered keys)
-  // and BEFORE creating the socket so all handlers can be registered synchronously
-  // in the connect callback, avoiding a race condition where data arrives before
-  // the on("data") handler is attached.
   const fakeToReal = await loadFakeToRealMapAsync();
 
-  // Re-set content-length
   const outHeaders: Record<string, string> = { ...reqHeaders };
   outHeaders["content-length"] = String(finalBody.length);
-  delete outHeaders["transfer-encoding"]; // we've buffered, no chunked
-  // Force plain-text response — compressed bodies can't be scanned for secrets.
+  delete outHeaders["transfer-encoding"];
   outHeaders["accept-encoding"] = "identity";
 
-  const outSocket = tls.connect({ host: hostname, port, servername: hostname });
+  await new Promise<void>((resolve, reject) => {
+    const outSocket = tls.connect({ host: hostname, port, servername: hostname });
+    let settled = false;
+    let responseHeadersDone = false;
+    let textBuffer = "";
+    const decoder = new StringDecoder("utf8");
+    const fakeKeys = Array.from(fakeToReal.keys());
+    let isSse = false;
+    let isChunked = false;
+    let isCompressed = false;
+    let rawBuf: Buffer = Buffer.alloc(0);
+    let handleEndCalled = false;
+    let sseChunkParser: IncrementalChunkedBodyParser | null = null;
+    let sseEventBuffer: SseEventBuffer | null = null;
 
-  // Set up error handlers synchronously
-  outSocket.on("error", (e) => { dbg("upstream error:", e.message); clientTls.destroy(); });
-  clientTls.on("error", () => outSocket.destroy());
+    function finish(err?: Error): void {
+      if (settled) return;
+      settled = true;
+      outSocket.destroy();
+      if (err) {
+        reject(err);
+      } else {
+        resolve();
+      }
+    }
 
-  if (fakeToReal.size === 0) {
-    // No mappings — pipe response directly and write request on connect
+    function sendToClient(chunk: Buffer): void {
+      if (!clientTls.destroyed) clientTls.write(chunk);
+    }
+
+    function sendSseEvents(events: string[]): void {
+      for (const event of events) {
+        if (event.length === 0) continue;
+        if (isChunked) {
+          sendToClient(encodeChunkedPayload(event));
+        } else {
+          sendToClient(Buffer.from(event, "utf8"));
+        }
+      }
+      if (events.length > 0) dbg(`[SSE] flushed ${events.length} event(s)`);
+    }
+
+    function processSseBody(rawBody: Buffer): void {
+      if (rawBody.length === 0 || handleEndCalled) return;
+      if (!sseEventBuffer) sseEventBuffer = new SseEventBuffer(fakeToReal);
+
+      if (!isChunked) {
+        sendSseEvents(sseEventBuffer.push(rawBody));
+        return;
+      }
+
+      if (!sseChunkParser) sseChunkParser = new IncrementalChunkedBodyParser();
+      const parsed = sseChunkParser.push(rawBody);
+      for (const payload of parsed.payloads) {
+        sendSseEvents(sseEventBuffer.push(payload));
+      }
+      if (parsed.terminal) handleEnd();
+    }
+
+    function handleData(chunk: Buffer): void {
+      if (!responseHeadersDone) {
+        rawBuf = Buffer.concat([rawBuf, chunk]);
+        textBuffer += decoder.write(chunk);
+
+        const headerEnd = textBuffer.indexOf("\r\n\r\n");
+        if (headerEnd === -1) return;
+
+        responseHeadersDone = true;
+        const headers = textBuffer.slice(0, headerEnd + 4);
+        const ctHeaderMatch = headers.toLowerCase().match(/content-type:\s*([^\r\n]+)/);
+        const ctValue = ctHeaderMatch?.[1]?.trim() ?? "(none)";
+        const ceHeaderMatch = headers.toLowerCase().match(/content-encoding:\s*([^\r\n]+)/);
+        const ceValue = ceHeaderMatch?.[1]?.trim() ?? "none";
+        isSse = /content-type\s*:\s*text\/event-stream/i.test(headers);
+        isChunked = /transfer-encoding\s*:\s*chunked/i.test(headers);
+        isCompressed = !isSse && /content-encoding\s*:\s*(gzip|br|zstd|deflate)/i.test(headers);
+        dbg(`response isSse=${isSse}, isChunked=${isChunked}, isCompressed=${isCompressed}, content-type=${ctValue}, content-encoding=${ceValue} for ${hostname}`);
+        sendToClient(Buffer.from(headers, "utf8"));
+
+        if (isCompressed) {
+          const rawBody = rawBuf.slice(headerEnd + 4);
+          if (rawBody.length > 0) sendToClient(rawBody);
+          rawBuf = Buffer.alloc(0);
+          textBuffer = "";
+          return;
+        }
+        if (isSse) {
+          sseEventBuffer = new SseEventBuffer(fakeToReal);
+          if (isChunked) sseChunkParser = new IncrementalChunkedBodyParser();
+          const rawBody = rawBuf.slice(headerEnd + 4);
+          rawBuf = Buffer.alloc(0);
+          textBuffer = "";
+          processSseBody(rawBody);
+          return;
+        }
+
+        textBuffer = textBuffer.slice(headerEnd + 4);
+        rawBuf = Buffer.alloc(0);
+      } else {
+        if (isCompressed) {
+          sendToClient(chunk);
+          return;
+        }
+        if (isSse) {
+          processSseBody(chunk);
+          return;
+        }
+        textBuffer += decoder.write(chunk);
+      }
+
+      if (textBuffer.length === 0) return;
+
+      const safeLen = findSafeFlushLength(textBuffer, fakeKeys);
+      if (safeLen > 0) {
+        const toProcess = textBuffer.slice(0, safeLen);
+        textBuffer = textBuffer.slice(safeLen);
+        const { unmasked, count } = unmaskText(toProcess, fakeToReal);
+        if (count > 0) dbg(`[non-SSE] unmasked ${count} secret(s)`);
+        sendToClient(Buffer.from(unmasked, "utf8"));
+      }
+    }
+
+    function handleEnd(): void {
+      if (handleEndCalled) return;
+      handleEndCalled = true;
+      const decoderTail = decoder.end();
+      if (!isSse && !isCompressed) textBuffer += decoderTail;
+      dbg(`[handleEnd] isSse=${isSse} isCompressed=${isCompressed} textBuffer=${textBuffer.length}B`);
+
+      if (isSse) {
+        if (!sseEventBuffer) sseEventBuffer = new SseEventBuffer(fakeToReal);
+        sendSseEvents(sseEventBuffer.finish());
+        if (isChunked) sendToClient(TERMINAL_CHUNK);
+      } else if (!isCompressed && textBuffer.length > 0) {
+        const { unmasked, count } = unmaskText(textBuffer, fakeToReal);
+        if (count > 0) dbg(`[handleEnd] unmasked ${count} remaining secret(s)`);
+        sendToClient(Buffer.from(unmasked, "utf8"));
+      }
+
+      finish();
+    }
+
+    outSocket.on("error", (e) => {
+      dbg("upstream error:", e.message);
+      finish(e instanceof Error ? e : new Error(String(e)));
+    });
+    clientTls.on("error", () => outSocket.destroy());
+
     outSocket.on("connect", () => {
       const headerLines = Object.entries(outHeaders)
         .map(([k, v]) => `${k}: ${v}`)
@@ -365,239 +443,13 @@ async function forwardRequest(
       outSocket.write(`${method} ${urlPath} HTTP/1.1\r\n${headerLines}\r\n\r\n`);
       if (finalBody.length > 0) outSocket.write(finalBody);
     });
-    outSocket.pipe(clientTls);
-    return;
-  }
 
-  // ── Intercept response and unmask fake tokens back to real ──────────────────
-
-  let responseHeadersDone = false;
-  let textBuffer = "";
-  const decoder = new StringDecoder("utf8");
-  const fakeKeys = Array.from(fakeToReal.keys());
-  let isSse = false;
-  let isChunked = false;
-  let isCompressed = false; // gzip/br/zstd — body is binary, must pipe raw bytes
-  let rawBuf: Buffer = Buffer.alloc(0); // raw bytes before header detection completes
-  let sseTerminalChunkSeen = false;     // set when the HTTP terminal 0-chunk is stripped
-  let handleEndCalled = false;          // guard against double-invocation
-
-  // ── SSE partial_json reassembly ──────────────────────────────────────────────
-  // Anthropic streams tool-call arguments as incremental `partial_json` deltas;
-  // the fake key is split across many events so raw byte scanning won't find it.
-  // We collect all raw SSE bytes and unmask the fully-assembled stream at once.
-  let sseRawBuf: Buffer = Buffer.alloc(0);
-
-  // Fragment-aware unmask for SSE partial_json deltas and text_delta events.
-  function unmaskSseFragments(text: string): string {
-    // Simple pass: replace contiguous fake keys (handles cases where full fake
-    // key appears in a single event or non-streaming JSON response).
-    let result = text;
-    const { unmasked: simple, count: simpleCount } = unmaskText(text, fakeToReal);
-    if (simpleCount > 0) { result = simple; dbg(`[SSE] simple unmask: ${simpleCount}`); }
-
-    // Helper: collect all JSON string values for a field, concat, unmask, redistribute.
-    function reassembleField(src: string, fieldName: string): string {
-      const frags: { start: number; end: number; decoded: string }[] = [];
-      const prefix = `"${fieldName}":"`;
-      const re = new RegExp(`"${fieldName}":"((?:[^"\\\\]|\\\\.)*)"`, "g");
-      let m: RegExpExecArray | null;
-      while ((m = re.exec(src)) !== null) {
-        const valueStart = m.index + prefix.length;
-        let decoded: string;
-        try { decoded = JSON.parse('"' + m[1] + '"'); } catch { continue; }
-        frags.push({ start: valueStart, end: valueStart + m[1].length, decoded });
-      }
-      if (frags.length === 0) return src;
-      const logical = frags.map(f => f.decoded).join("");
-      const { unmasked: lu, count } = unmaskText(logical, fakeToReal);
-      if (count === 0) return src;
-      dbg(`[SSE] fragment unmask (${fieldName}): ${count} secret(s)`);
-      let logPos = 0;
-      const newVals: string[] = [];
-      for (const frag of frags) {
-        newVals.push(JSON.stringify(lu.slice(logPos, logPos + frag.decoded.length)).slice(1, -1));
-        logPos += frag.decoded.length;
-      }
-      let out = src;
-      for (let i = frags.length - 1; i >= 0; i--) {
-        out = out.slice(0, frags[i].start) + newVals[i] + out.slice(frags[i].end);
-      }
-      return out;
-    }
-
-    // partial_json: tool-call argument fragments (Anthropic streaming)
-    result = reassembleField(result, "partial_json");
-    // text: text_delta content fragments (Anthropic streaming)
-    result = reassembleField(result, "text");
-    // content: OpenAI-compatible streaming format
-    result = reassembleField(result, "content");
-
-    return result;
-  }
-
-  // Process collected raw SSE bytes: strip chunk framing, unmask, re-emit as separate chunks.
-  function processSseAndSend(): void {
-    const rawText = sseRawBuf.toString("utf8");
-    const stripped = stripChunkSizeLines(rawText);
-    const unmasked = unmaskSseFragments(stripped);
-
-    // Re-emit each event as a separate HTTP chunk (matches raw pipe format).
-    let rest = unmasked;
-    let eventsWritten = 0;
-    while (true) {
-      const sep = rest.indexOf("\n\n");
-      if (sep === -1) {
-        if (rest.trim()) {
-          const len = Buffer.byteLength(rest, "utf8");
-          clientTls.write(Buffer.from(`${len.toString(16)}\r\n${rest}\r\n`, "utf8"));
-          eventsWritten++;
-        }
-        break;
-      }
-      const ev = rest.slice(0, sep + 2);
-      rest = rest.slice(sep + 2);
-      if (ev.trim()) {
-        const len = Buffer.byteLength(ev, "utf8");
-        clientTls.write(Buffer.from(`${len.toString(16)}\r\n${ev}\r\n`, "utf8"));
-        eventsWritten++;
-      }
-    }
-    clientTls.write(Buffer.from("0\r\n\r\n", "utf8"));
-    dbg(`[SSE] processSseAndSend: ${eventsWritten} events from ${sseRawBuf.length}B`);
-  }
-
-  // Chunk-size lines are bare hex digits — SSE data lines always start with
-  // "data:", "event:", etc., so stripping hex-only lines is safe.
-  // Sets sseTerminalChunkSeen=true if the HTTP terminal 0-chunk is encountered.
-  function stripChunkSizeLines(text: string): string {
-    return text
-      .replace(/\r\n/g, "\n")
-      .replace(/^([0-9a-fA-F]+)(?:;[^\n]*)?\n/gm, (_, hex) => {
-        if (parseInt(hex, 16) === 0) sseTerminalChunkSeen = true;
-        return "";
-      });
-  }
-
-  // Detect the HTTP terminal chunk ("0\r\n\r\n") in raw bytes.
-  // When the upstream server has finished the SSE stream, it closes with this marker.
-  function rawBytesHaveTerminal(buf: Buffer): boolean {
-    // Look for \r\n0\r\n\r\n (end of last data chunk + terminal chunk)
-    // OR just 0\r\n\r\n at the very start (if it arrives in its own packet).
-    for (let i = 0; i <= buf.length - 5; i++) {
-      if (buf[i] === 0x30 && buf[i+1] === 0x0D && buf[i+2] === 0x0A &&
-          buf[i+3] === 0x0D && buf[i+4] === 0x0A) {
-        return true; // found "0\r\n\r\n"
-      }
-    }
-    return false;
-  }
-
-  function handleData(chunk: Buffer): void {
-    if (!responseHeadersDone) {
-      // Keep a raw copy for compressed body pass-through (headers are ASCII-safe)
-      rawBuf = Buffer.concat([rawBuf, chunk]);
-      textBuffer += decoder.write(chunk);
-
-      const headerEnd = textBuffer.indexOf("\r\n\r\n");
-      if (headerEnd === -1) return; // wait for complete headers
-
-      responseHeadersDone = true;
-      const headers = textBuffer.slice(0, headerEnd + 4);
-      const ctHeaderMatch = headers.toLowerCase().match(/content-type:\s*([^\r\n]+)/);
-      const ctValue = ctHeaderMatch?.[1]?.trim() ?? "(none)";
-      const ceHeaderMatch = headers.toLowerCase().match(/content-encoding:\s*([^\r\n]+)/);
-      const ceValue = ceHeaderMatch?.[1]?.trim() ?? "none";
-      isSse = /content-type\s*:\s*text\/event-stream/i.test(headers);
-      isChunked = /transfer-encoding\s*:\s*chunked/i.test(headers);
-      isCompressed = !isSse && /content-encoding\s*:\s*(gzip|br|zstd|deflate)/i.test(headers);
-      dbg(`response isSse=${isSse}, isChunked=${isChunked}, isCompressed=${isCompressed}, content-type=${ctValue}, content-encoding=${ceValue} for ${hostname}`);
-      // Forward headers as-is.
-      clientTls.write(Buffer.from(headers, "utf8"));
-
-      if (isCompressed) {
-        // Body is binary — use raw bytes (headerEnd is byte-accurate for ASCII headers).
-        const rawBody = rawBuf.slice(headerEnd + 4);
-        if (rawBody.length > 0) clientTls.write(rawBody);
-        rawBuf = Buffer.alloc(0);
-        textBuffer = "";
-        return; // compressed: all subsequent chunks handled below
-      }
-      if (isSse) {
-        // SSE: collect raw bytes; unmask + re-emit when terminal chunk seen.
-        const rawBody = rawBuf.slice(headerEnd + 4);
-        rawBuf = Buffer.alloc(0);
-        textBuffer = "";
-        if (rawBody.length > 0) {
-          sseRawBuf = Buffer.concat([sseRawBuf, rawBody]);
-          if (rawBytesHaveTerminal(rawBody)) { processSseAndSend(); handleEnd(); }
-        }
-        return;
-      }
-      // Non-compressed, non-SSE: fall through with body in textBuffer
-      textBuffer = textBuffer.slice(headerEnd + 4);
-      rawBuf = Buffer.alloc(0);
-      // ↓ Fall through to process body in same call (don't return!)
-    } else {
-      // Subsequent chunks after headers already detected
-      if (isCompressed) {
-        clientTls.write(chunk);
-        return;
-      }
-      if (isSse) {
-        sseRawBuf = Buffer.concat([sseRawBuf, chunk]);
-        if (rawBytesHaveTerminal(chunk)) { processSseAndSend(); handleEnd(); }
-        return;
-      }
-      textBuffer += decoder.write(chunk);
-    }
-
-    if (textBuffer.length === 0) return;
-
-    if (!isSse) {
-      // ── Non-SSE plain JSON response ──────────────────────────────────────────
-      // Fake key is contiguous in the response body → raw byte unmask works.
-      const safeLen = findSafeFlushLength(textBuffer, fakeKeys);
-      if (safeLen > 0) {
-        const toProcess = textBuffer.slice(0, safeLen);
-        textBuffer = textBuffer.slice(safeLen);
-        const { unmasked, count } = unmaskText(toProcess, fakeToReal);
-        if (count > 0) dbg(`[non-SSE] unmasked ${count} secret(s)`);
-        clientTls.write(Buffer.from(unmasked, "utf8"));
-      }
+    if (fakeToReal.size === 0) {
+      outSocket.on("data", sendToClient);
+      outSocket.on("end", () => finish());
       return;
     }
 
-  } // end handleData
-
-  function handleEnd(): void {
-    if (handleEndCalled) return; // guard against double-invocation (terminal chunk + TCP close)
-    handleEndCalled = true;
-    textBuffer += decoder.end();
-    dbg(`[handleEnd] isSse=${isSse} isCompressed=${isCompressed} textBuffer=${textBuffer.length}B`);
-    if (isCompressed || isSse) {
-      // Raw bytes (including terminal chunk) were already piped through.
-      clientTls.end();
-      return;
-    }
-    if (textBuffer.length > 0) {
-      const { unmasked, count } = unmaskText(textBuffer, fakeToReal);
-      if (count > 0) dbg(`[handleEnd] unmasked ${count} remaining secret(s)`);
-      clientTls.write(Buffer.from(unmasked, "utf8"));
-    }
-    clientTls.end();
-  }
-
-  // Register all handlers synchronously in connect callback to avoid race condition
-  outSocket.on("connect", () => {
-    // Write request
-    const headerLines = Object.entries(outHeaders)
-      .map(([k, v]) => `${k}: ${v}`)
-      .join("\r\n");
-    outSocket.write(`${method} ${urlPath} HTTP/1.1\r\n${headerLines}\r\n\r\n`);
-    if (finalBody.length > 0) outSocket.write(finalBody);
-
-    // Attach response handlers immediately after writing the request
     outSocket.on("data", handleData);
     outSocket.on("end", handleEnd);
   });
@@ -607,6 +459,8 @@ async function forwardRequest(
 
 async function main(): Promise<void> {
   ensureCA();
+  void warmMaskCacheAsync().catch((e) => dbg("mask cache warmup failed:", e));
+  dbg("MITM allowlist:", Array.from(ALLOWED_HOSTS));
 
   const server = http.createServer((req, res) => {
     // Handle plain HTTP (shouldn't happen for AI APIs, but handle gracefully)

@@ -17,7 +17,26 @@ export const dim   = (msg: string) => console.log(c.dim(`  ${msg}`));
 
 export function requireMacOS(): void {
   if (process.platform !== "darwin") {
-    error("macOS Keychain required. dotmask only works on macOS.");
-    process.exit(1);
+    throw new Error("macOS Keychain required. dotmask only works on macOS.");
   }
+}
+
+export function parsePortFlag(args: string[], defaultPort: number): number {
+  const idx = args.indexOf("--port");
+  if (idx === -1) return defaultPort;
+
+  const raw = args[idx + 1];
+  if (raw === undefined) {
+    throw new Error("--port requires a value");
+  }
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(`invalid --port value: ${raw}`);
+  }
+
+  const port = Number.parseInt(raw, 10);
+  if (port < 1 || port > 65535) {
+    throw new Error(`port must be between 1 and 65535: ${raw}`);
+  }
+
+  return port;
 }
