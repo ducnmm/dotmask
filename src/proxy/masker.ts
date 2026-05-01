@@ -13,6 +13,16 @@ export const AI_DOMAINS = new Set([
   "openrouter.ai",
   "api.openrouter.ai",
   "generativelanguage.googleapis.com",
+  "api.deepseek.com",
+  "api.groq.com",
+  "api.moonshot.ai",
+  "api.together.ai",
+  "api.fireworks.ai",
+  "api.cerebras.ai",
+  "api.x.ai",
+  "api.inference.huggingface.co",
+  "api.minimax.io",
+  "api.minimax.chat",
 ]);
 
 export function isAiDomain(host: string): boolean {
